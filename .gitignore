@@ -1,0 +1,40 @@
+# Secrets & credentials
+.env
+.env.*
+!.env.example
+wallet_data.txt
+
+# Live state files — runtime JSON written by agents
+shared/analyst-state.json
+shared/trade-state.json
+shared/risk-state.json
+shared/cannon-state.json
+shared/strategy-params.json
+shared/withdraw-log.json
+shared/*.json
+
+# Dependencies
+node_modules/
+
+# Next.js build output
+.next/
+out/
+
+# Logs
+*.log
+logs/
+
+# Backup / broken files
+*.broken
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+
+# TypeScript incremental build
+*.tsbuildinfo
+
+# Misc
+.vercel
