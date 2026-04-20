@@ -150,6 +150,8 @@ interface TradeState {
   usdcBalance: string;
   lastTrade: LastTrade | null;
   tradeLog: TradeLogEntry[];
+  openPositionUsdcSpent: number;
+  openPositionEthHeld: number;
   lastSignalSeen: {
     signal: string;
     strength: string;
@@ -173,10 +175,9 @@ let skippedCount          = 0;
 let lastTrade: LastTrade | null = null;
 let tradeLog: TradeLogEntry[] = [];
 
-// P&L tracking — set on BUY, consumed on SELL
-let lastBuyPriceUsd: number | null = null;
-let lastBuyUsdcSpent: number | null = null;
-let lastBuyEthReceived: number | null = null;
+// Open position tracking — weighted average cost basis (WACB) across all open BUYs
+let openPositionUsdcSpent: number = 0; // total USDC spent on currently open BUY positions
+let openPositionEthHeld: number   = 0; // total ETH held from currently open BUY positions
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -205,6 +206,8 @@ function writeTradeState(
     usdcBalance,
     lastTrade,
     tradeLog,
+    openPositionUsdcSpent,
+    openPositionEthHeld,
     lastSignalSeen,
     executedCount,
     skippedCount,
@@ -620,19 +623,21 @@ async function evaluate(
     let pnlPct: string | null = null;
 
     if (signal.signal === "BUY") {
-      lastBuyPriceUsd    = signal.price;
-      lastBuyUsdcSpent   = fromAmountNum;
-      lastBuyEthReceived = toAmountNum;
-    } else if (signal.signal === "SELL" && lastBuyPriceUsd !== null && lastBuyUsdcSpent !== null) {
-      const usdcReceived = toAmountNum;
-      pnlUsd = usdcReceived - lastBuyUsdcSpent;
-      pnlPct = `${((pnlUsd / lastBuyUsdcSpent) * 100).toFixed(2)}%`;
+      openPositionUsdcSpent += fromAmountNum;
+      openPositionEthHeld   += toAmountNum;
+    } else if (signal.signal === "SELL" && openPositionEthHeld > 0) {
+      const usdcReceived  = toAmountNum;
+      const wacb          = openPositionUsdcSpent / openPositionEthHeld;
+      const costOfEthSold = fromAmountNum * wacb;
+      pnlUsd = usdcReceived - costOfEthSold;
+      pnlPct = `${((pnlUsd / costOfEthSold) * 100).toFixed(2)}%`;
       const pnlColor = pnlUsd >= 0 ? "\x1b[32m" : "\x1b[31m";
       console.log(`  P&L: ${pnlColor}${pnlUsd >= 0 ? "+" : ""}${pnlUsd.toFixed(4)} USDC (${pnlPct})${RESET}  ` +
-        `entry=$${lastBuyPriceUsd.toFixed(2)}  exit=$${signal.price.toFixed(2)}`);
-      lastBuyPriceUsd = null;
-      lastBuyUsdcSpent = null;
-      lastBuyEthReceived = null;
+        `wacb=$${wacb.toFixed(2)}  exit=$${signal.price.toFixed(2)}`);
+      // Reduce open position proportionally to fraction of ETH sold
+      const fractionSold    = fromAmountNum / openPositionEthHeld;
+      openPositionEthHeld   = Math.max(0, openPositionEthHeld - fromAmountNum);
+      openPositionUsdcSpent = Math.max(0, openPositionUsdcSpent * (1 - fractionSold));
     }
 
     // Append to rolling trade log (last 50)
@@ -747,21 +752,39 @@ tx_hash: ${logEntry.txHash}
 function restorePnlState(): void {
   const saved = readJson<TradeState>(TRADE_STATE);
   if (!saved?.tradeLog?.length) return;
-  tradeLog = saved.tradeLog;
+  tradeLog      = saved.tradeLog;
   executedCount = saved.executedCount ?? 0;
   skippedCount  = saved.skippedCount  ?? 0;
   lastTrade     = saved.lastTrade ?? null;
-  // Restore open BUY position for P&L tracking (last BUY with no subsequent SELL)
-  for (let i = tradeLog.length - 1; i >= 0; i--) {
-    const entry = tradeLog[i];
-    if (entry.action === "SELL") break;
-    if (entry.action === "BUY") {
-      lastBuyPriceUsd    = entry.entryPriceUsd;
-      lastBuyUsdcSpent   = parseFloat(entry.fromAmount);
-      lastBuyEthReceived = parseFloat(entry.toAmount);
-      console.log(`[TradeClaw] Restored open BUY: $${lastBuyPriceUsd} entry, ${lastBuyUsdcSpent} USDC spent`);
-      break;
+
+  // Use persisted open position state if available (fast path)
+  if (typeof saved.openPositionUsdcSpent === "number" &&
+      typeof saved.openPositionEthHeld   === "number") {
+    openPositionUsdcSpent = saved.openPositionUsdcSpent;
+    openPositionEthHeld   = saved.openPositionEthHeld;
+  } else {
+    // Reconstruct WACB position by replaying tradeLog (backward-compat for old state files)
+    openPositionUsdcSpent = 0;
+    openPositionEthHeld   = 0;
+    for (const entry of tradeLog) {
+      if (entry.action === "BUY") {
+        openPositionUsdcSpent += parseFloat(entry.fromAmount);
+        openPositionEthHeld   += parseFloat(entry.toAmount);
+      } else if (entry.action === "SELL" && openPositionEthHeld > 0) {
+        const ethSold  = parseFloat(entry.fromAmount);
+        const fraction = ethSold / openPositionEthHeld;
+        openPositionEthHeld   = Math.max(0, openPositionEthHeld - ethSold);
+        openPositionUsdcSpent = Math.max(0, openPositionUsdcSpent * (1 - fraction));
+      }
     }
+  }
+
+  if (openPositionEthHeld > 0) {
+    const wacb = openPositionUsdcSpent / openPositionEthHeld;
+    console.log(
+      `[TradeClaw] Restored open position: ${openPositionEthHeld.toFixed(6)} ETH ` +
+      `@ $${wacb.toFixed(2)} WACB ($${openPositionUsdcSpent.toFixed(2)} total cost)`,
+    );
   }
 }
 
