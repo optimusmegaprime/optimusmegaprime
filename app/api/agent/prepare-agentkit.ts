@@ -86,7 +86,13 @@ export async function prepareAgentkitAndWalletProvider(): Promise<{
           `No ownerAddress or privateKey found in ${WALLET_DATA_FILE}, will create a new CDP server account as owner`,
         );
     } catch (error) {
-      console.error("Error reading wallet data:", error);
+      // Corrupted wallet file — throw instead of silently creating a new wallet
+      // (which would orphan existing on-chain funds at the old address)
+      throw new Error(
+        `${WALLET_DATA_FILE} exists but could not be parsed. ` +
+        `Refusing to create a new wallet to avoid orphaning existing funds. ` +
+        `Fix or delete ${WALLET_DATA_FILE} manually. Original error: ${(error as Error).message}`,
+      );
     }
   }
 

@@ -277,7 +277,10 @@ const HTML = getHTML();
 
 const server = http.createServer(async (req, res) => {
   const u = new URL(req.url, `http://localhost:${PORT}`);
-  res.setHeader('Access-Control-Allow-Origin', '*');
+  const origin = req.headers['origin'] || '';
+  if (origin === 'http://localhost:3001' || origin === 'http://127.0.0.1:3001' || !origin) {
+    res.setHeader('Access-Control-Allow-Origin', origin || 'http://localhost:3001');
+  }
 
   if (u.pathname === '/api/state') {
     res.writeHead(200, { 'Content-Type': 'application/json' });

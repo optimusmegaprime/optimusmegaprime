@@ -726,7 +726,7 @@ async function runCannon(trigger: "startup" | "scheduled" | "manual"): Promise<v
       alignmentReason: typeof opusResult.alignmentReason === "string"
         ? opusResult.alignmentReason.substring(0, 500)
         : "No reason provided.",
-      performanceScore: typeof opusResult.performanceScore === "number"
+      performanceScore: typeof opusResult.performanceScore === "number" && Number.isFinite(opusResult.performanceScore)
         ? Math.max(0, Math.min(100, Math.round(opusResult.performanceScore)))
         : 50,
       metricsSnapshot: mergedMetrics,

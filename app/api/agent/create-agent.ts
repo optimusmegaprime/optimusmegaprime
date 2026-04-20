@@ -41,7 +41,7 @@ export async function createAgent(): Promise<ReturnType<typeof createReactAgent>
   }
 
   if (!process.env.ANTHROPIC_API_KEY) {
-    throw new Error("I need an OPENAI_API_KEY in your .env file to power my intelligence.");
+    throw new Error("I need an ANTHROPIC_API_KEY in your .env file to power my intelligence.");
   }
 
   const { agentkit, walletProvider } = await prepareAgentkitAndWalletProvider();
