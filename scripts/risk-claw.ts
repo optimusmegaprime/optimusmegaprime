@@ -82,6 +82,15 @@ interface TradeLogEntry {
   pnlUsd:    number | null;
 }
 
+interface LotRecord {
+  id: string;
+  status: "OPEN" | "PARTIAL" | "CLOSED";
+  entryPriceUsd: number;
+  ethRemaining: number;
+  stopLossPct: number | null;
+  profitTargetPct: number;
+}
+
 interface TradeState {
   timestamp:    string;
   ethBalance:   string;
@@ -89,11 +98,20 @@ interface TradeState {
   executedCount: number;
   skippedCount:  number;
   tradeLog:     TradeLogEntry[];
+  lots:         LotRecord[];
   lastTrade: {
     timestamp: string; action: "BUY" | "SELL";
     fromAmount: string; fromTokenName: string;
     toAmount: string; toTokenName: string; txHash: string;
   } | null;
+}
+
+export interface StopLossFlag {
+  lotId:        string;
+  triggerPrice: number;   // entryPriceUsd * (1 - stopLossPct)
+  currentPrice: number;
+  entryPrice:   number;
+  stopLossPct:  number;
 }
 
 export interface RiskState {
@@ -131,6 +149,8 @@ export interface RiskState {
   volatilityRegime:    "CHOPPY" | "NORMAL" | "TRENDING";
   volatilityMultiplier: number;
   rsiRange10:           number | null;
+  // Per-lot stop-loss flags (written every 60s, consumed by TradeClaw Gate 0c)
+  stopLossFlags: StopLossFlag[];
 }
 
 // ── Module state ──────────────────────────────────────────────────────────────
@@ -227,14 +247,40 @@ function fetchLiquidityDepth(): Promise<{ depthUsd: number | null; warning: bool
   });
 }
 
+// ── Per-lot stop-loss scan ────────────────────────────────────────────────────
+function scanStopLosses(
+  lots: LotRecord[],
+  currentPrice: number,
+): StopLossFlag[] {
+  const flags: StopLossFlag[] = [];
+  for (const lot of lots) {
+    if (lot.status === "CLOSED") continue;
+    if (lot.stopLossPct === null || lot.stopLossPct <= 0) continue;
+    if (lot.ethRemaining <= 0.000001) continue;
+
+    const triggerPrice = lot.entryPriceUsd * (1 - lot.stopLossPct);
+    if (currentPrice <= triggerPrice) {
+      flags.push({
+        lotId:        lot.id,
+        triggerPrice: parseFloat(triggerPrice.toFixed(2)),
+        currentPrice: parseFloat(currentPrice.toFixed(2)),
+        entryPrice:   lot.entryPriceUsd,
+        stopLossPct:  lot.stopLossPct,
+      });
+    }
+  }
+  return flags;
+}
+
 // ── Core risk evaluation ──────────────────────────────────────────────────────
 function evaluate(
-  peakSoFar: number,
-  analyst:   AnalystState | null,
-  trade:     TradeState   | null,
-  winStats:  ReturnType<typeof computeWinStats>,
-  vol:       ReturnType<typeof getVolatility>,
-  liq:       { depthUsd: number | null; warning: boolean },
+  peakSoFar:     number,
+  analyst:       AnalystState | null,
+  trade:         TradeState   | null,
+  winStats:      ReturnType<typeof computeWinStats>,
+  vol:           ReturnType<typeof getVolatility>,
+  liq:           { depthUsd: number | null; warning: boolean },
+  stopLossFlags: StopLossFlag[],
 ): { state: RiskState } {
   const ethPrice  = analyst?.price ?? 0;
   const ethBal    = parseFloat(trade?.ethBalance  ?? "0");
@@ -309,6 +355,7 @@ function evaluate(
     volatilityRegime:    vol.regime,
     volatilityMultiplier: vol.multiplier,
     rsiRange10:          vol.rsiRange !== null ? parseFloat(vol.rsiRange.toFixed(2)) : null,
+    stopLossFlags,
   };
 
   return { state };
@@ -428,6 +475,7 @@ function printState(state: RiskState): void {
   if (state.winRateWarning)                      console.log(`  \u26a0  Win rate <${WIN_RATE_ALERT_PCT * 100}% over last ${WIN_RATE_LOOKBACK} trades`);
   if (state.liquidityWarning)                    console.log(`  \u26a0  Low liquidity: $${state.liquidityDepthUsd?.toFixed(0) ?? "--"} (min $${LIQUIDITY_MIN_USD.toLocaleString()})`);
   if (state.volatilityRegime === "CHOPPY")       console.log(`  \u26a0  CHOPPY market (RSI range ${state.rsiRange10} pts) — position size halved`);
+  if (state.stopLossFlags.length > 0)            console.log(`  \u26d4 STOP-LOSS: ${state.stopLossFlags.length} lot(s) triggered — TradeClaw will force-close`);
   if (state.riskNarrative)                       console.log(`  \u2139 ${state.riskNarrative}`);
 }
 
@@ -491,6 +539,18 @@ async function main(): Promise<void> {
       const ethBal       = parseFloat(trade?.ethBalance  ?? "0");
       const usdcBal      = parseFloat(trade?.usdcBalance ?? "0");
       const portfolioUsd = ethBal * ethPrice + usdcBal;
+
+      // Per-lot stop-loss scan (arithmetic, independent of signal)
+      const stopLossFlags = scanStopLosses(trade?.lots ?? [], ethPrice);
+      if (stopLossFlags.length > 0) {
+        for (const f of stopLossFlags) {
+          console.log(
+            `[RiskClaw] \x1b[31m⚠ STOP-LOSS\x1b[0m lot ${f.lotId.substring(0, 18)}...  ` +
+            `entry $${f.entryPrice.toFixed(2)}  trigger $${f.triggerPrice.toFixed(2)}  ` +
+            `current $${f.currentPrice.toFixed(2)}  (-${(f.stopLossPct * 100).toFixed(0)}%)`,
+          );
+        }
+      }
       if (portfolioUsd > peak) {
         if (portfolioUsd > candidatePeak) {
           candidatePeak = portfolioUsd;
@@ -512,7 +572,7 @@ async function main(): Promise<void> {
       }
 
       // Step 1: arithmetic evaluation (synchronous, instant)
-      const { state } = evaluate(peak, analyst, trade, winStats, vol, liq);
+      const { state } = evaluate(peak, analyst, trade, winStats, vol, liq, stopLossFlags);
 
       // Write immediately so TradeClaw always has fresh HALT + multiplier data
       fs.writeFileSync(RISK_STATE, JSON.stringify(state, null, 2));

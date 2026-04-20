@@ -420,6 +420,36 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (u.pathname === '/api/lots') {
+    try {
+      const fp = path.join(SHARED_DIR, 'trade-state.json');
+      const trade = fs.existsSync(fp) ? JSON.parse(fs.readFileSync(fp, 'utf8')) : null;
+      const lots = trade?.lots ?? [];
+      const ethPrice = (() => {
+        try {
+          const af = path.join(SHARED_DIR, 'analyst-state.json');
+          return fs.existsSync(af) ? (JSON.parse(fs.readFileSync(af, 'utf8'))?.price ?? 0) : 0;
+        } catch { return 0; }
+      })();
+      const enriched = lots.map(lot => ({
+        ...lot,
+        unrealizedPnlUsd: lot.status !== 'CLOSED' && ethPrice > 0
+          ? parseFloat(((lot.ethRemaining * ethPrice) - lot.usdcCostRemaining).toFixed(4))
+          : null,
+        unrealizedPnlPct: lot.status !== 'CLOSED' && ethPrice > 0 && lot.usdcCostRemaining > 0
+          ? (((lot.ethRemaining * ethPrice - lot.usdcCostRemaining) / lot.usdcCostRemaining) * 100).toFixed(2) + '%'
+          : null,
+        currentPriceUsd: ethPrice > 0 ? ethPrice : null,
+      }));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ lots: enriched, count: lots.length, ethPrice }));
+    } catch(e) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ lots: [], count: 0, error: e.message }));
+    }
+    return;
+  }
+
   if (u.pathname === '/api/candles') {
     try {
       const gran = u.searchParams.get('granularity') || 'ONE_MINUTE';
