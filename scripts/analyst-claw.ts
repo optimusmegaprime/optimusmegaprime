@@ -855,11 +855,13 @@ function computeSignalAlgorithmic(opts: {
 
 // ── Analysis Runner ───────────────────────────────────────────────────────────
 let analysisInProgress = false;
+let analysisStartedAt  = 0; // epoch ms — non-zero when a run is in progress
 
 async function analyse(candleWindow: CandleWindow, tickBuffer: TickBuffer, triggerCandle: Candle): Promise<void> {
   if (analysisInProgress) return;
   analysisInProgress = true;
-  const t0 = Date.now();
+  analysisStartedAt  = Date.now();
+  const t0 = analysisStartedAt;
 
   try {
     const candles = candleWindow.get();
@@ -973,6 +975,7 @@ async function analyse(candleWindow: CandleWindow, tickBuffer: TickBuffer, trigg
     );
   } finally {
     analysisInProgress = false;
+    analysisStartedAt  = 0;
   }
 }
 
@@ -981,7 +984,11 @@ async function seedFromREST(): Promise<Candle[]> {
   const end   = Math.floor(Date.now() / 1000);
   const start = end - SEED_CANDLES * 60;
   const url   = `${REST_URL}/${PRODUCT_ID}/candles?start=${start}&end=${end}&granularity=${GRANULARITY}&limit=${SEED_CANDLES}`;
-  const res   = await fetch(url, { headers: { "Content-Type": "application/json" } });
+  // AbortSignal.timeout required — without it a stalled TCP connection hangs the entire process forever
+  const res   = await fetch(url, {
+    headers: { "Content-Type": "application/json" },
+    signal: AbortSignal.timeout(30_000),
+  });
   if (!res.ok) throw new Error(`REST seed failed: ${res.status} ${await res.text()}`);
   const json = await res.json() as {
     candles: { start: string; open: string; high: string; low: string; close: string; volume: string }[];
@@ -1083,15 +1090,43 @@ async function main(): Promise<void> {
   const candleWindow = new CandleWindow();
   const tickBuffer   = new TickBuffer();
 
+  // Seed with retry — without a timeout on the fetch the process can hang forever
   console.log("[AnalystClaw] Seeding candle window from REST API…");
-  const seedCandles = await seedFromREST();
-  candleWindow.seed(seedCandles);
-  console.log(`[AnalystClaw] Window seeded with ${candleWindow.size()} candles.`);
+  let seeded = false;
+  for (let attempt = 1; attempt <= 3 && !seeded; attempt++) {
+    try {
+      const seedCandles = await seedFromREST();
+      candleWindow.seed(seedCandles);
+      console.log(`[AnalystClaw] Window seeded with ${candleWindow.size()} candles (attempt ${attempt}).`);
+      seeded = true;
+    } catch (err) {
+      console.warn(`[AnalystClaw] Seed attempt ${attempt} failed: ${(err as Error).message}`);
+      if (attempt < 3) await new Promise((r) => setTimeout(r, 5_000));
+    }
+  }
+  if (!seeded) throw new Error("Failed to seed candle window after 3 attempts — cannot start.");
 
   const seedCandle = candleWindow.get().at(-1)!;
   await analyse(candleWindow, tickBuffer, seedCandle);
 
   connectWebSocket(candleWindow, tickBuffer);
+
+  // Heartbeat: log every 60s so a silent freeze is immediately visible in logs
+  setInterval(() => {
+    const stateAge = fs.existsSync(STATE_FILE)
+      ? Math.round((Date.now() - fs.statSync(STATE_FILE).mtimeMs) / 1000)
+      : -1;
+    const lockAge = analysisInProgress && analysisStartedAt > 0
+      ? Math.round((Date.now() - analysisStartedAt) / 1000)
+      : 0;
+    if (lockAge > 120) {
+      // analysisInProgress stuck for >2min — reset the lock so new candles can fire
+      console.error(`[AnalystClaw] ⚠ analysisInProgress stuck for ${lockAge}s — force-resetting lock`);
+      analysisInProgress = false;
+      analysisStartedAt  = 0;
+    }
+    console.log(`[AnalystClaw] ♥ heartbeat  state_age=${stateAge}s  lock=${analysisInProgress}(${lockAge}s)  ticks=${tickBuffer.size()}  candles=${candleWindow.size()}`);
+  }, 60_000);
 }
 
 main().catch((err) => {
