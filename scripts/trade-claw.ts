@@ -94,6 +94,7 @@ const SLIPPAGE_BPS     = 100;   // 1% slippage tolerance
 const MAX_SIGNAL_AGE_MS  = 20 * 60 * 1000; // 20 min — ignore stale signals
 const TRADE_COOLDOWN_MS  = 15 * 60 * 1000; // 15 min between trades
 const POLL_INTERVAL_MS   = 30_000;
+const MAX_RISK_STATE_AGE_MS = 3 * 60 * 1000; // 3 min — stale risk-state treated as HALT
 
 // File paths
 const ANALYST_STATE = path.join(__dirname, "../shared/analyst-state.json");
@@ -335,9 +336,22 @@ async function evaluate(
   const ethStr  = fmt(ethBalance, 6);
   const usdcStr = fmt(usdcBalance, 2);
 
-  // ── Gate 0: RiskClaw HALT check ──────────────────────────────────────────
+  // ── Gate 0: RiskClaw HALT check (with freshness guard) ───────────────────
   const riskState = readJson<RiskState>(RISK_STATE);
-  if (riskState?.halted) {
+  const riskAgeMs = riskState ? now - new Date(riskState.timestamp).getTime() : Infinity;
+  if (!riskState || riskAgeMs > MAX_RISK_STATE_AGE_MS) {
+    const reason = !riskState
+      ? "risk-state.json missing — RiskClaw may not be running"
+      : `risk-state.json stale (${Math.round(riskAgeMs / 1000)}s old) — RiskClaw may be down`;
+    console.log(`[TradeClaw] \x1b[31mHALTED\x1b[0m: ${reason}`);
+    writeTradeState(walletAddress, ethStr, usdcStr, "IDLE", {
+      signal: signal.signal, strength: signal.strength, price: signal.price,
+      candleStart: signal.candleStart, action: "SKIPPED", skipReason: reason,
+    });
+    skippedCount++;
+    return;
+  }
+  if (riskState.halted) {
     console.log(`[TradeClaw] \x1b[31mHALTED\x1b[0m by RiskClaw: ${riskState.haltReason}`);
     writeTradeState(walletAddress, ethStr, usdcStr, "IDLE", {
       signal: signal.signal,
@@ -730,8 +744,30 @@ tx_hash: ${logEntry.txHash}
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
+function restorePnlState(): void {
+  const saved = readJson<TradeState>(TRADE_STATE);
+  if (!saved?.tradeLog?.length) return;
+  tradeLog = saved.tradeLog;
+  executedCount = saved.executedCount ?? 0;
+  skippedCount  = saved.skippedCount  ?? 0;
+  lastTrade     = saved.lastTrade ?? null;
+  // Restore open BUY position for P&L tracking (last BUY with no subsequent SELL)
+  for (let i = tradeLog.length - 1; i >= 0; i--) {
+    const entry = tradeLog[i];
+    if (entry.action === "SELL") break;
+    if (entry.action === "BUY") {
+      lastBuyPriceUsd    = entry.entryPriceUsd;
+      lastBuyUsdcSpent   = parseFloat(entry.fromAmount);
+      lastBuyEthReceived = parseFloat(entry.toAmount);
+      console.log(`[TradeClaw] Restored open BUY: $${lastBuyPriceUsd} entry, ${lastBuyUsdcSpent} USDC spent`);
+      break;
+    }
+  }
+}
+
 async function main(): Promise<void> {
   initVault();
+  restorePnlState();
   console.log("\n[TradeClaw] Starting trade executor");
   console.log(`  LLM routing:    claude CLI subprocess (Gate 5 approval)`);
   console.log(`  Analyst state:  ${ANALYST_STATE}`);
