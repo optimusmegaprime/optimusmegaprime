@@ -41,6 +41,8 @@ const MAX_DRAWDOWN        = 0.40;
 const MAX_POSITION_SIZE   = 0.25;
 const MIN_PORTFOLIO_USD   = 0.10;
 const POLL_INTERVAL_MS    = 60_000;
+const PEAK_CONFIRMATION_READINGS  = 3;    // consecutive readings above current peak before committing
+const PEAK_SPIKE_RESET_THRESHOLD  = 0.10; // reset stored peak if >10% above current portfolio on startup
 const LIQUIDITY_MIN_USD   = 50_000;
 const WIN_RATE_ALERT_PCT  = 0.40;
 const WIN_RATE_LOOKBACK   = 10;
@@ -133,6 +135,8 @@ export interface RiskState {
 
 // ── Module state ──────────────────────────────────────────────────────────────
 const rsiHistory: number[] = [];
+let candidatePeak: number          = 0; // unconfirmed peak candidate (smoothing buffer)
+let consecutivePeakReadings: number = 0; // how many consecutive readings have exceeded current peak
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function readJson<T>(filePath: string): T | null {
@@ -231,16 +235,16 @@ function evaluate(
   winStats:  ReturnType<typeof computeWinStats>,
   vol:       ReturnType<typeof getVolatility>,
   liq:       { depthUsd: number | null; warning: boolean },
-): { state: RiskState; newPeak: number } {
+): { state: RiskState } {
   const ethPrice  = analyst?.price ?? 0;
   const ethBal    = parseFloat(trade?.ethBalance  ?? "0");
   const usdcBal   = parseFloat(trade?.usdcBalance ?? "0");
   const tradeCount = trade?.executedCount ?? 0;
   const portfolioUsd = ethBal * ethPrice + usdcBal;
 
-  const newPeak  = Math.max(peakSoFar, portfolioUsd);
-  const drawdown = newPeak > MIN_PORTFOLIO_USD && portfolioUsd < newPeak
-    ? (newPeak - portfolioUsd) / newPeak : 0;
+  // peakSoFar is the externally managed, smoothed peak — do not update it here
+  const drawdown = peakSoFar > MIN_PORTFOLIO_USD && portfolioUsd < peakSoFar
+    ? (peakSoFar - portfolioUsd) / peakSoFar : 0;
 
   const signal   = analyst?.signal   ?? "HOLD";
   const strength = analyst?.strength ?? "WEAK";
@@ -265,7 +269,7 @@ function evaluate(
     halted = true;
     haltReason =
       `Max drawdown exceeded: ${pct(drawdown)} (limit ${pct(MAX_DRAWDOWN)}) — ` +
-      `portfolio $${portfolioUsd.toFixed(2)} vs peak $${newPeak.toFixed(2)}`;
+      `portfolio $${portfolioUsd.toFixed(2)} vs peak $${peakSoFar.toFixed(2)}`;
   } else if (!positionSizeOk && actionable) {
     halted = true;
     haltReason =
@@ -279,7 +283,7 @@ function evaluate(
     halted,
     haltReason,
     portfolioValueUsd:     parseFloat(portfolioUsd.toFixed(4)),
-    peakPortfolioValueUsd: parseFloat(newPeak.toFixed(4)),
+    peakPortfolioValueUsd: parseFloat(peakSoFar.toFixed(4)),
     drawdown:              parseFloat(drawdown.toFixed(6)),
     drawdownPct:           pct(drawdown),
     ethBalance:            ethBal.toFixed(6),
@@ -307,7 +311,7 @@ function evaluate(
     rsiRange10:          vol.rsiRange !== null ? parseFloat(vol.rsiRange.toFixed(2)) : null,
   };
 
-  return { state, newPeak };
+  return { state };
 }
 
 // ── Claude CLI subprocess ─────────────────────────────────────────────────────
@@ -440,7 +444,25 @@ async function main(): Promise<void> {
 
   const lastState = readJson<RiskState>(RISK_STATE);
   let peak = lastState?.peakPortfolioValueUsd ?? 0;
-  if (peak > 0) console.log(`[RiskClaw] Restored peak portfolio: $${peak.toFixed(2)}`);
+  if (peak > 0) {
+    // Validate stored peak: if it's more than PEAK_SPIKE_RESET_THRESHOLD above the current
+    // portfolio, treat it as a stale price spike artifact and reset to current portfolio value.
+    const initAnalyst  = readJson<AnalystState>(ANALYST_STATE);
+    const initTrade    = readJson<TradeState>(TRADE_STATE);
+    const initEthPrice = initAnalyst?.price ?? 0;
+    const initEthBal   = parseFloat(initTrade?.ethBalance  ?? "0");
+    const initUsdcBal  = parseFloat(initTrade?.usdcBalance ?? "0");
+    const initPortfolio = initEthBal * initEthPrice + initUsdcBal;
+    if (initPortfolio > MIN_PORTFOLIO_USD && peak > initPortfolio * (1 + PEAK_SPIKE_RESET_THRESHOLD)) {
+      console.log(
+        `[RiskClaw] Peak $${peak.toFixed(2)} is >${(PEAK_SPIKE_RESET_THRESHOLD * 100).toFixed(0)}% above ` +
+        `current $${initPortfolio.toFixed(2)} — resetting to current portfolio (likely stale price spike)`,
+      );
+      peak = initPortfolio;
+    } else {
+      console.log(`[RiskClaw] Restored peak portfolio: $${peak.toFixed(2)}`);
+    }
+  }
 
   const dir = path.dirname(RISK_STATE);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -464,9 +486,33 @@ async function main(): Promise<void> {
       const vol      = getVolatility();
       const liq      = await fetchLiquidityDepth();
 
+      // Peak smoothing: require PEAK_CONFIRMATION_READINGS consecutive readings above confirmed peak
+      const ethPrice     = analyst?.price ?? 0;
+      const ethBal       = parseFloat(trade?.ethBalance  ?? "0");
+      const usdcBal      = parseFloat(trade?.usdcBalance ?? "0");
+      const portfolioUsd = ethBal * ethPrice + usdcBal;
+      if (portfolioUsd > peak) {
+        if (portfolioUsd > candidatePeak) {
+          candidatePeak = portfolioUsd;
+          consecutivePeakReadings = 1;
+        } else {
+          consecutivePeakReadings++;
+        }
+        if (consecutivePeakReadings >= PEAK_CONFIRMATION_READINGS) {
+          console.log(`[RiskClaw] New confirmed peak: $${candidatePeak.toFixed(2)} (${PEAK_CONFIRMATION_READINGS} consecutive readings)`);
+          peak = candidatePeak;
+          candidatePeak = 0;
+          consecutivePeakReadings = 0;
+        } else {
+          console.log(`[RiskClaw] Peak candidate $${portfolioUsd.toFixed(2)} (${consecutivePeakReadings}/${PEAK_CONFIRMATION_READINGS} needed)`);
+        }
+      } else {
+        candidatePeak = 0;
+        consecutivePeakReadings = 0;
+      }
+
       // Step 1: arithmetic evaluation (synchronous, instant)
-      const { state, newPeak } = evaluate(peak, analyst, trade, winStats, vol, liq);
-      peak = newPeak;
+      const { state } = evaluate(peak, analyst, trade, winStats, vol, liq);
 
       // Write immediately so TradeClaw always has fresh HALT + multiplier data
       fs.writeFileSync(RISK_STATE, JSON.stringify(state, null, 2));
